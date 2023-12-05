@@ -5,14 +5,27 @@ import json
 from datetime import datetime
 from typing import List, Dict, Tuple
 import random
-from utils import parse_evaluation, get_color, text_to_html, calculate_average, get_random_score
+from utils import (parse_evaluation, get_color, text_to_html, calculate_average, get_random_score, 
+                   num_tokens_from_string, api_details)
 from prompts import safeguard_assessment
 import time
 from datetime import datetime
 import logging
+import pyperclip
 
 # Make sure to set the OPENAI_API_KEY in your environment variables.
 openai.api_key = os.getenv('OPENAI_API_KEY')
+
+@st.cache_resource
+def get_model_list():
+    model_list = openai.Model.list()
+    all_ids = [item['id'] for item in model_list['data']]
+    ids = [id for id in all_ids if id in api_details]
+    
+    if 'gpt-3.5-turbo-0613' in ids:
+        ids.insert(0, ids.pop(ids.index('gpt-3.5-turbo-0613')))
+        
+    return ids
 
 # set to True to use placeholder evals
 placeholder_eval = False
@@ -33,7 +46,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
 class MessageStorage:
     """
     A class for storing chat messages with a timestamp to a file.
@@ -41,11 +53,6 @@ class MessageStorage:
 
     def __init__(self, file_path: str = 'chat_history.json'):
         self._file_path = file_path
-        self._initialize_messages()
-
-    def _initialize_messages(self):
-        if 'messages' not in st.session_state:
-            st.session_state.messages = []
 
     def store_message(self, message: Dict[str, str]):
         """Stores a message dictionary with a timestamp to a JSON file."""
@@ -54,12 +61,11 @@ class MessageStorage:
             json.dump(message_with_timestamp, f)
             f.write('\n')
 
-
 class OpenAIResponder:
     """
     A class to handle responses from OpenAI's GPT model.
     """
-    def __init__(self, api_key: str, model: str = 'gpt-3.5-turbo'):
+    def __init__(self, api_key: str, model: str = 'gpt-3.5-turbo-0613'):
         self._api_key = api_key
         self._model = model
 
@@ -69,12 +75,32 @@ class OpenAIResponder:
         status = 'ERR'
         details = None
         try:
+            total_toks = 0
             valid_messages = []
+            msg_nr = 0
+            first_msg_idx = 0
             for msg in messages:
                 if msg['role'] in ['system', 'assistant', 'user', 'function']:
-                    if status not in msg or msg['status'] == 'OK':
+                    if status not in msg or msg['status'] in ['OK', 'WARN']:
                         valid_messages.append({'role': msg['role'], 'content': msg['content']})
-
+                        total_toks += num_tokens_from_string(msg['content'], "cl100k_base")
+                        msg_nr += 1
+            
+            if total_toks + 100 >= api_details[self._model]['context']:
+                st.session_state.chat_length_warning = True
+                extra_toks = total_toks + 100 - api_details[self._model]['context']
+                start_toks = 0
+                for idx, msg in enumerate(valid_messages):
+                    start_toks += num_tokens_from_string(msg['content'], "cl100k_base")
+                    if start_toks >= extra_toks:
+                        first_msg_idx = idx + 1
+                        break
+                print('dropping first ', first_msg_idx, ' messsages')
+            if first_msg_idx <= msg_nr - 1:
+                valid_messages = valid_messages[first_msg_idx:]
+            else:
+                raise Exception("The message you entered does not fit into the context of the selected model.")      
+            
             response = openai.ChatCompletion.create(
                 model=self._model, messages=valid_messages
             )
@@ -86,6 +112,16 @@ class OpenAIResponder:
             details['id'] = response.id 
             details['model'] = response.model
             details['usage'] = response.usage
+            
+            model = response.model
+            usage = response.usage
+            
+            if model not in st.session_state.token_consumption:
+                st.session_state.token_consumption[model] = {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0}
+                
+            st.session_state.token_consumption[model]['prompt_tokens'] += usage['prompt_tokens']
+            st.session_state.token_consumption[model]['completion_tokens'] += usage['completion_tokens']
+            st.session_state.token_consumption[model]['total_tokens'] += usage['total_tokens']
 
             status = 'OK' if details['finish_reason'] == 'stop' else 'WARN'
             return response.choices[0].message['content'], status, details
@@ -104,6 +140,8 @@ class OpenAIResponder:
             content = f"OpenAI API request was not permitted: {e}"
         except openai.error.RateLimitError as e:
             content = f"OpenAI API request exceeded rate limit: {e}"
+        except Exception as e:
+            content = f"{e}"
 
         return content, status, details
 
@@ -138,7 +176,6 @@ class ChatUI:
             for chunk in message['content'].split():
                 full_response += chunk + " "
                 time.sleep(0.05)
-                #message_placeholder.markdown(full_response + "▌")
                 message_placeholder.markdown(full_response + '▌')
         if color != 'white':
             message_placeholder.markdown(":"+ color + "[" + message['content'] + "]")
@@ -158,10 +195,10 @@ class ChatUI:
                 role = message['role']
                 if role == 'user':
                     with st.chat_message('user'):
-                        st.write(message['content'])
+                        st.write(message['content']) 
                 elif role == 'assistant':
                     with st.chat_message('assistant'):
-                        # we only want to stream the last received AI repsonse
+                    # we only want to stream the last received AI repsonse
                         ChatUI.print_message(message, idx == msg_ct - 1)
                 else:
                     with st.chat_message(role):
@@ -258,12 +295,13 @@ class ChatUI:
             status = random.choice(['OK', 'WARN', 'ERR'])
 
         # we add the message to the state
-        st.session_state.messages.append({
+        received_message = {
             'role': 'assistant', 
             'content': response, 
             'status' : status
-        })
-        st.session_state.last_ai_response = response
+        }
+        st.session_state.messages.append(received_message)
+        st.session_state.last_ai_response = received_message
         st.session_state.last_ai_response_details = details
 
         # Store the messages using MessageStorage
@@ -315,6 +353,7 @@ class SafeguardAI:
             content, status, details = self._responder.get_response(
                 [{'role': 'system', 'content': prompt}]
             )
+
             logger.info(content)
         
             score, assessment = parse_evaluation(content)
@@ -455,6 +494,17 @@ class SafeguardAI:
         else:
             self._display_normal(column)
 
+def copy_chat_to_clipboard():
+    chat_list  = []
+    for idx, message in enumerate(st.session_state.messages):
+        chat_list.append('role: ' + message['role'] + ' \n')
+        chat_list.append(message['content'] + ' \n\n')
+    chat_text = ''.join(chat_list)
+    pyperclip.copy(chat_text)
+    
+def reset_chat():
+    st.session_state.messages = []
+    st.rerun()
 
 def main():
     st.set_page_config(
@@ -474,49 +524,70 @@ def main():
     MessageStorage()  
     # Initialize session state
     default_session_state = {
-          'last_ai_response': None,
-          'last_ai_response_details' : None,
-          'evaluate_pressed': False,
-          'disable_eval_button': False,
-          'obtain_evaluation': False,
-          'display_evaluation': False,
-          'reversed': False,
-          'expandable': False,
-          'evals': None,
-          'user_input_to_be_processed': False,
-          'show_user_input': True,
-          'disable_user_input': False,
-          'waiting_for_AI_response': False,
-          'AI_response_received': False,
-          'show_message_toast' : False,
-          'streaming' : False,
-          'stream_message' : True,
-          'model_id' : 'gpt-3.5-turbo',
-          'evaluations_received' : False
-          }
+        'messages' : [],
+        'last_ai_response': None,
+        'last_ai_response_details' : None,
+        'evaluate_pressed': False,
+        'disable_eval_button': False,
+        'obtain_evaluation': False,
+        'display_evaluation': False,
+        'reversed': False,
+        'expandable': False,
+        'evals': None, 
+        'user_input_to_be_processed': False,
+        'show_user_input': True,
+        'disable_user_input': False,
+        'waiting_for_AI_response': False,
+        'AI_response_received': False,
+        'new_message_toast' : False,
+        'streaming' : False,
+        'stream_message' : False,
+        'model_id' : 'gpt-3.5-turbo-0613',
+        'evaluations_received' : False,
+        'token_consumption' : {},
+        'chat_length_warning' : False}
     for key, default_value in default_session_state.items():
           if key not in st.session_state:
               st.session_state[key] = default_value
-
+              
     with st.sidebar:
+        with st.expander('API Use', expanded=False):
+            price = 0
+            for model in st.session_state.token_consumption:
+                if model in api_details:
+                    price += st.session_state.token_consumption[model]['prompt_tokens'] * api_details[model]['prompt']
+                    price += st.session_state.token_consumption[model]['completion_tokens'] * api_details[model]['output']
+            price = price / 1000
+            st.write("Total: $" + "{:.4f}".format(price))
+            
+            for model in st.session_state.token_consumption:
+                st.write(model + ': ')
+                st.text('input tokens: ' +  
+                         str(st.session_state.token_consumption[model]['prompt_tokens']) + 
+                         '\noutput tokens: ' + 
+                         str(st.session_state.token_consumption[model]['completion_tokens']) +
+                         '\ntotal tokens: ' + 
+                         str(st.session_state.token_consumption[model]['total_tokens'])
+                         )
+                
         st.title('Settings')
         selected_model_id = st.selectbox(
-            'Selected Model',
-            ['gpt-3.5-turbo', 'gpt-3.5-turbo-16k',
-             'gpt-4', 'gpt-4-32k'],
-             key='select_model',
-             label_visibility='visible',
-             disabled=st.session_state.disable_user_input)
+            'Primary AI Model',
+            get_model_list(),
+            key='select_model',
+            label_visibility='visible',
+            disabled=st.session_state.disable_user_input)
 
         if selected_model_id != st.session_state.model_id:
             st.session_state.model_id = selected_model_id
             st.toast('Primary AI model set to ' + st.session_state.model_id)
+            
+        st.caption(str(api_details[st.session_state.model_id]['context']) + ' token context window')
         
         if st.checkbox(
             'Reversed', 
             key='reversed_checkbox',
             disabled=st.session_state.disable_user_input,
-            value = st.session_state.reversed,
         ):
             st.session_state.reversed = True
         else:
@@ -532,11 +603,10 @@ def main():
         else:
             st.session_state.streaming = False
 
-        with st.expander('Info', expanded=False):
+        with st.expander('Response Info', expanded=False):
             if st.session_state.last_ai_response_details is not None:
                 for field in st.session_state.last_ai_response_details:
                     st.write(str(field) + ': ' + str(st.session_state.last_ai_response_details[field]))
-
 
     col1, col2 = st.columns([1, 5])  # Adjust the ratio as needed
     with col1:
@@ -570,6 +640,21 @@ def main():
         primary_AI_responder = OpenAIResponder(
             api_key = openai.api_key, 
             model = st.session_state.model_id)
+        
+        subcol1, subcol2, _ = st.columns([1, 1, 1])
+        if subcol1.button(
+                'Copy Chat', 
+                key='copy_chat',
+        ):
+            copy_chat_to_clipboard()
+            
+        if subcol2.button(
+                'Reset Chat', 
+                key='reset_chat',
+        ):
+            reset_chat()
+        
+        
 
         # We put the input below or above the messages depending on the reversed status
         ChatUI.display_chat_input(col1, primary_AI_responder, top = True)
@@ -580,7 +665,7 @@ def main():
     # Safeguard AI column
     with col2:
         st.subheader('Safeguard AI', anchor=False)
-        subcol1, subcol2 = col2.columns([1, 2])
+        subcol1, subcol2, _ = col2.columns([1, 1, 1])
         if st.session_state.last_ai_response is not None:
             if subcol1.button(
                 'Evaluate', 
@@ -602,7 +687,7 @@ def main():
         if st.session_state.obtain_evaluation:
             with st.spinner('Waiting for evaluations'):
                 safeguard_ai.obtain_safeguard_evaluation(
-                    st.session_state.last_ai_response
+                    st.session_state.last_ai_response['content']
                 )
                 st.session_state.evaluations_received = True
 
@@ -633,7 +718,6 @@ def main():
 
     if st.session_state.AI_response_received:
         st.session_state.AI_response_received = False
-        #st.session_state.show_message_toast = True
         st.session_state.stream_message = True
         st.rerun()
 
@@ -645,14 +729,20 @@ def main():
         st.session_state.disable_eval_button = False
         # we show the user text input again
         st.session_state.show_user_input = True
-        st.session_state.show_message_toast = True
+        st.session_state.new_message_toast = True
 
         st.rerun()
 
-    if st.session_state.show_message_toast:
-        st.session_state.show_message_toast = False
+    if st.session_state.new_message_toast:
+        st.session_state.new_message_toast = False
         if show_message_toast:
-            st.toast('Response received successfully!')
+            if st.session_state.last_ai_response is not None:
+                if not ('status' in st.session_state.last_ai_response and st.session_state.last_ai_response['status'] != 'OK'):
+                    st.toast('Response received successfully!')
+            
+    if st.session_state.chat_length_warning:
+        st.session_state.chat_length_warning = False
+        st.toast('Replies from the beginning of the conversation will be dropped to fit into the model context window.')
 
     if st.session_state.evaluate_pressed:
         # we remove eisting evals

@@ -1,5 +1,6 @@
 import re
 import random
+import tiktoken
 
 def parse_evaluation(text):
     score_str = 'E'
@@ -133,3 +134,19 @@ def get_random_score():
     # Randomly select and return one score
     return random.choice(possible_scores)
 
+# in $ / 1K tokens
+api_details = {
+    'gpt-3.5-turbo-1106' : {'prompt' : 0.001, 'output' : 0.002, 'context' : 16385},
+    'gpt-3.5-turbo-0613' : {'prompt' : 0.001, 'output' : 0.002, 'context' : 4096},
+    'gpt-3.5-turbo-16k-1106' : {'prompt' : 0.002, 'output' : 0.004, 'context' : 16385},
+    'gpt-3.5-turbo-16k-0613' : {'prompt' : 0.002, 'output' : 0.004, 'context' : 16385},
+    'gpt-4-0613' : {'prompt' : 0.03, 'output' : 0.06, 'context' : 8192},
+    'gpt-4-32k-0613' : {'prompt' : 0.06, 'output' : 0.12, 'context' : 32768},
+    'gpt-4-1106-preview' : {'prompt' : 0.01, 'output' : 0.03, 'context' : 128000},
+    }
+
+def num_tokens_from_string(string: str, encoding_name: str) -> int:
+    """Returns the number of tokens in a text string."""
+    encoding = tiktoken.get_encoding(encoding_name)
+    num_tokens = len(encoding.encode(string))
+    return num_tokens
